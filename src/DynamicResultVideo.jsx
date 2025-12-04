@@ -45,12 +45,61 @@ function DynamicResultVideo({ presignedUrl }) {
       console.log('Auth headers:', {
         hasToken: !!(authToken || envToken || apiKey),
         headerKeys: Object.keys(headers),
+        hasLocalStorageToken: !!authToken,
+        hasEnvToken: !!envToken,
+        hasApiKey: !!apiKey,
+        envTokenLength: envToken ? envToken.length : 0,
       });
     }
     
     return headers;
   };
   
+  // Check if presigned URL is expired
+  const checkPresignedUrlExpiration = (presignedUrl) => {
+    try {
+      const url = new URL(presignedUrl);
+      const expiresParam = url.searchParams.get('X-Amz-Expires');
+      const dateParam = url.searchParams.get('X-Amz-Date');
+      
+      if (expiresParam && dateParam) {
+        // Parse date: 20251203T090434Z
+        const year = dateParam.substring(0, 4);
+        const month = dateParam.substring(4, 6);
+        const day = dateParam.substring(6, 8);
+        const hour = dateParam.substring(9, 11);
+        const minute = dateParam.substring(11, 13);
+        const second = dateParam.substring(13, 15);
+        
+        const expirationDate = new Date(
+          `${year}-${month}-${day}T${hour}:${minute}:${second}Z`
+        );
+        expirationDate.setSeconds(expirationDate.getSeconds() + parseInt(expiresParam));
+        
+        const now = new Date();
+        const isExpired = now > expirationDate;
+        const timeUntilExpiry = expirationDate - now;
+        
+        if (isExpired) {
+          console.warn('⚠️ Presigned URL has EXPIRED!', {
+            expiredAt: expirationDate.toISOString(),
+            expiredAgo: Math.round((now - expirationDate) / 1000 / 60) + ' minutes ago'
+          });
+          return { isExpired: true, expirationDate, timeUntilExpiry: 0 };
+        } else {
+          console.log('✅ Presigned URL is valid', {
+            expiresAt: expirationDate.toISOString(),
+            expiresIn: Math.round(timeUntilExpiry / 1000 / 60) + ' minutes'
+          });
+          return { isExpired: false, expirationDate, timeUntilExpiry };
+        }
+      }
+    } catch (err) {
+      console.warn('Could not parse presigned URL expiration:', err);
+    }
+    return { isExpired: false, expirationDate: null, timeUntilExpiry: null };
+  };
+
   // Extract file name and folder from presigned URL
   const extractFileInfo = (presignedUrl) => {
     try {
@@ -58,14 +107,21 @@ function DynamicResultVideo({ presignedUrl }) {
       const pathParts = url.pathname.split('/').filter(p => p);
       
       // Path format: /dev/{simulationId}/dynamic-result.json
-      // fileName is the last part, folderName is the second-to-last
+      // folderName could be "dev" or the simulationId, depending on API structure
       const fileName = pathParts[pathParts.length - 1]?.split('?')[0] || null;
-      const folderName = pathParts.length > 1 ? pathParts[pathParts.length - 2] : 'videos';
+      const simulationId = pathParts.length > 1 ? pathParts[pathParts.length - 2] : null;
+      const baseFolder = pathParts.length > 2 ? pathParts[pathParts.length - 3] : null; // "dev"
       
-      return { fileName, folderName };
+      // Return both possible folder names for the API to try
+      return { 
+        fileName, 
+        folderName: simulationId, // Try simulationId first
+        baseFolder: baseFolder, // "dev" if exists
+        simulationId: simulationId 
+      };
     } catch (err) {
       console.error('Error extracting file info:', err);
-      return { fileName: null, folderName: 'videos' };
+      return { fileName: null, folderName: 'videos', baseFolder: null, simulationId: null };
     }
   };
 
@@ -77,6 +133,14 @@ function DynamicResultVideo({ presignedUrl }) {
 
         if (!presignedUrl) {
           throw new Error('No presigned URL provided');
+        }
+
+        // Check if presigned URL is expired
+        const expirationCheck = checkPresignedUrlExpiration(presignedUrl);
+        if (expirationCheck.isExpired) {
+          throw new Error(
+            `Presigned URL has expired. Please get a fresh presigned URL. The URL expired at ${expirationCheck.expirationDate?.toLocaleString()}.`
+          );
         }
 
         // Check actual Content-Type header, not URL extension
@@ -98,7 +162,7 @@ function DynamicResultVideo({ presignedUrl }) {
           setHlsUrl(hlsUrlResult);
           setConverting(false);
         }
-
+        
       } catch (err) {
         console.error('Error processing video:', err);
         setError(err.message || 'Failed to process video');
@@ -145,69 +209,182 @@ function DynamicResultVideo({ presignedUrl }) {
     }
   };
 
+  // Handle stream API response
+  const handleStreamResponse = (response, originalUrl) => {
+    console.log('API Response Status:', response.status);
+    console.log('API Response Data:', response.data);
+    console.log('API Response Headers:', response.headers);
+
+    // The API should return HLS URL or stream URL
+    if (response.data.hlsUrl || response.data.streamUrl || response.data.url) {
+      const hlsUrl = response.data.hlsUrl || response.data.streamUrl || response.data.url;
+      console.log('HLS/Stream URL received:', hlsUrl);
+      return hlsUrl;
+    } else if (response.data.jobId) {
+      // Async conversion
+      return pollConversionStatus(response.data.jobId, originalUrl);
+    } else if (typeof response.data === 'string' && response.data.startsWith('http')) {
+      // Direct URL string response
+      console.log('Direct URL response:', response.data);
+      return response.data;
+    } else {
+      console.error('Unexpected response format:', response.data);
+      throw new Error(`Invalid response from backend: ${JSON.stringify(response.data)}`);
+    }
+  };
+
   // Process JSON URL - backend will find MP4 and convert to HLS
   const processJsonUrl = async (jsonUrl) => {
     try {
       console.log('Processing URL through backend stream API...');
       
       // Extract file info from URL
-      const { fileName, folderName } = extractFileInfo(jsonUrl);
+      const { fileName, folderName, baseFolder, simulationId } = extractFileInfo(jsonUrl);
       
       if (!fileName) {
         throw new Error('Could not extract file name from URL');
       }
       
-      // Extract simulation ID to find corresponding video file
-      // Path format: /dev/{simulationId}/dynamic-result.json
-      const url = new URL(jsonUrl);
-      const pathParts = url.pathname.split('/').filter(p => p);
-      const simulationId = pathParts.length > 1 ? pathParts[pathParts.length - 2] : null;
+      // Try multiple video file name patterns
+      const videoFileNamePatterns = [];
       
-      // Try to find video file - common patterns
-      let videoFileName = fileName;
       if (fileName.includes('dynamic-result.json')) {
-        videoFileName = fileName.replace('dynamic-result.json', 'dynamic-video.mp4');
+        // Try exact replacements first
+        videoFileNamePatterns.push(
+          fileName.replace('dynamic-result.json', 'dynamic-video.mp4'),
+          fileName.replace('dynamic-result.json', 'video.mp4'),
+          fileName.replace('dynamic-result.json', 'output.mp4'),
+          fileName.replace('dynamic-result.json', 'result.mp4'),
+          // Try with simulation ID
+          `dynamic-video-${simulationId}.mp4`,
+          `video-${simulationId}.mp4`,
+          // Try just the base name
+          'dynamic-video.mp4',
+          'video.mp4',
+          'output.mp4'
+        );
       } else if (fileName.endsWith('.json')) {
-        videoFileName = fileName.replace('.json', '.mp4');
+        videoFileNamePatterns.push(
+          fileName.replace('.json', '.mp4'),
+          fileName.replace('.json', '-video.mp4'),
+          fileName.replace('.json', '-output.mp4'),
+          `video-${simulationId}.mp4`
+        );
       } else if (simulationId) {
-        videoFileName = `video-${simulationId}.mp4`;
+        videoFileNamePatterns.push(
+          `video-${simulationId}.mp4`,
+          `dynamic-video-${simulationId}.mp4`,
+          `${simulationId}.mp4`,
+          'video.mp4',
+          'dynamic-video.mp4'
+        );
       }
       
-      console.log('Requesting stream:', { fileName: videoFileName, folderName });
+      // Try multiple folder name patterns - prioritize the exact path structure from JSON URL
+      const folderNamePatterns = [
+        `${baseFolder}/${folderName}`, // "dev/645a061808581b0012ffaec3" - matches JSON path exactly
+        folderName, // "645a061808581b0012ffaec3" - simulationId only
+        baseFolder, // "dev" - base folder only
+        'videos',
+        `${baseFolder}/${folderName}/videos` // "dev/645a061808581b0012ffaec3/videos"
+      ].filter(Boolean);
       
-      // Call the stream API endpoint: GET /api/v4/aws/stream?fileName=...&folderName=...
-      const response = await axios.get(
-        `${API_BASE_URL}/v4/aws/stream`,
-        {
-          params: {
-            fileName: videoFileName,
-            folderName: folderName || 'videos',
-          },
-          headers: getAuthHeaders(),
-          timeout: 30000,
+      console.log('Trying file patterns:', videoFileNamePatterns);
+      console.log('Trying folder patterns:', folderNamePatterns);
+      
+      // Try each combination until one works
+      let lastError = null;
+      for (const videoFileName of videoFileNamePatterns) {
+        for (const tryFolderName of folderNamePatterns) {
+          try {
+            console.log(`Trying: fileName=${videoFileName}, folderName=${tryFolderName}`);
+            
+            const response = await axios.get(
+              `${API_BASE_URL}/v4/aws/stream`,
+              {
+                params: {
+                  fileName: videoFileName,
+                  folderName: tryFolderName,
+                },
+                headers: getAuthHeaders(),
+                timeout: 30000,
+              }
+            );
+            
+            // If we get here, the request succeeded
+            console.log('Success! Found file:', { fileName: videoFileName, folderName: tryFolderName });
+            return handleStreamResponse(response, jsonUrl);
+            
+          } catch (err) {
+            lastError = err;
+            
+            // Log detailed error information
+            if (err.response) {
+              console.log(`❌ Failed: ${err.response.status} - ${err.response.data?.message || err.message}`, {
+                fileName: videoFileName,
+                folderName: tryFolderName,
+                responseData: err.response.data
+              });
+            } else {
+              console.log(`❌ Failed: ${err.message}`, { fileName: videoFileName, folderName: tryFolderName });
+            }
+            
+            // If it's not a "Key Not Found" or 404 error, stop trying
+            if (err.response?.status !== 404 && 
+                err.response?.data?.message !== 'Key Not Found' &&
+                err.response?.status !== 400) {
+              throw err;
+            }
+            // Continue to next pattern
+          }
         }
-      );
-
-      console.log('API Response Status:', response.status);
-      console.log('API Response Data:', response.data);
-      console.log('API Response Headers:', response.headers);
-
-      // The API should return HLS URL or stream URL
-      if (response.data.hlsUrl || response.data.streamUrl || response.data.url) {
-        const hlsUrl = response.data.hlsUrl || response.data.streamUrl || response.data.url;
-        console.log('HLS/Stream URL received:', hlsUrl);
-        return hlsUrl;
-      } else if (response.data.jobId) {
-        // Async conversion
-        return await pollConversionStatus(response.data.jobId, jsonUrl);
-      } else if (typeof response.data === 'string' && response.data.startsWith('http')) {
-        // Direct URL string response
-        console.log('Direct URL response:', response.data);
-        return response.data;
-      } else {
-        console.error('Unexpected response format:', response.data);
-        throw new Error(`Invalid response from backend: ${JSON.stringify(response.data)}`);
       }
+      
+      // Last attempt: Try with just simulationId as folderName (some APIs work this way)
+      if (simulationId) {
+        console.log('Last attempt: Trying with simulationId only as folderName...');
+        const simpleFileNames = ['dynamic-video.mp4', 'video.mp4', 'output.mp4'];
+        for (const simpleFile of simpleFileNames) {
+          try {
+            const response = await axios.get(
+              `${API_BASE_URL}/v4/aws/stream`,
+              {
+                params: {
+                  fileName: simpleFile,
+                  folderName: simulationId,
+                },
+                headers: getAuthHeaders(),
+                timeout: 30000,
+              }
+            );
+            console.log('✅ Success! Found file:', { fileName: simpleFile, folderName: simulationId });
+            return handleStreamResponse(response, jsonUrl);
+          } catch (err) {
+            // Continue
+          }
+        }
+      }
+      
+      // If all patterns failed, provide detailed error message
+      const triedCombinations = videoFileNamePatterns.length * folderNamePatterns.length;
+      const errorDetails = {
+        triedFileNames: videoFileNamePatterns.slice(0, 5),
+        triedFolderNames: folderNamePatterns,
+        originalFileName: fileName,
+        simulationId: simulationId,
+        totalAttempts: triedCombinations
+      };
+      console.error('❌ All file name patterns failed:', errorDetails);
+      
+      throw new Error(
+        `Video file not found. Tried ${triedCombinations}+ combinations.\n\n` +
+        `Checked file names: ${videoFileNamePatterns.slice(0, 3).join(', ')}...\n` +
+        `Checked folders: ${folderNamePatterns.slice(0, 3).join(', ')}...\n\n` +
+        `⚠️ Please ask your backend team:\n` +
+        `1. What is the exact video file name for simulation ${simulationId}?\n` +
+        `2. What should the 'folderName' parameter be?\n` +
+        `3. Check API docs: https://apiv4dev.pantohealth.com/api/docs`
+      );
     } catch (err) {
       console.error('Error processing URL:', err);
       
