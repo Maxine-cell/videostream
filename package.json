@@ -13,7 +13,7 @@
     "hls.js": "^1.6.15",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "react-player": "^3.4.0",
+    "react-player": "^2.10.1",
     "react-scripts": "5.0.1",
     "web-vitals": "^2.1.4"
   },
@@ -21,7 +21,9 @@
     "start": "react-scripts start",
     "build": "react-scripts build",
     "test": "react-scripts test",
-    "eject": "react-scripts eject"
+    "eject": "react-scripts eject",
+    "serve-hls": "node server.js",
+    "serve-hls-simple": "cd hls_output && npx http-server -p 8000 -c-1 --cors"
   },
   "eslintConfig": {
     "extends": [
@@ -40,5 +42,8 @@
       "last 1 firefox version",
       "last 1 safari version"
     ]
+  },
+  "devDependencies": {
+    "cross-env": "^10.1.0"
   }
 }
