@@ -1,212 +1,225 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+import ReactPlayer from 'react-player';
 import Hls from 'hls.js';
 import './HLSPlayer.css';
 
 const HLSPlayer = ({ url, autoPlay = false }) => {
-  const videoRef = useRef(null);
+  const playerRef = useRef(null);
   const hlsRef = useRef(null);
-  const containerRef = useRef(null);
-  const settingsMenuRef = useRef(null);
-  
-  const [isLoading, setIsLoading] = useState(true);
+  const isSettingUpRef = useRef(false);
+  const userSelectedQualityRef = useRef(null);
+  const networkRetryCount = useRef(0);
+
+  const MAX_NETWORK_RETRIES = 3;
+
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [qualities, setQualities] = useState([]);
   const [currentQuality, setCurrentQuality] = useState(-1);
-  const [showSettings, setShowSettings] = useState(false);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [volume, setVolume] = useState(1);
-  const [showVolumeControl, setShowVolumeControl] = useState(false);
+  const [showQualityMenu, setShowQualityMenu] = useState(false);
+  const [userSelectedQuality, setUserSelectedQuality] = useState(null);
+  const qualityMenuRef = useRef(null);
 
-  // Load HLS stream
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
+    setLoading(true);
+    setError(null);
+    setQualities([]);
+    setCurrentQuality(-1);
+    setUserSelectedQuality(null);
+    userSelectedQualityRef.current = null;
+    networkRetryCount.current = 0;
+    isSettingUpRef.current = false;
 
-    const isHLS = url && (url.includes('.m3u8') || url.includes('application/vnd.apple.mpegurl'));
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+  }, [url]);
 
-    const cleanup = () => {
+  // Setup HLS
+  const setupHLS = useCallback(() => {
+    if (isSettingUpRef.current) return;
+
+    const player = playerRef.current?.getInternalPlayer();
+    if (!player) return;
+    if (hlsRef.current) return;
+
+    isSettingUpRef.current = true;
+
+    let hls = null;
+
+    if (Hls.isSupported()) {
+      hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        capLevelToPlayerSize: true,
+        startLevel: -1,
+        abrEwmaDefaultEstimate: 500000,
+        abrBandWidthFactor: 0.95,
+        abrBandWidthUpFactor: 0.7,
+        abrMaxWithRealBitrate: false,
+        maxStarvationDelay: 4,
+        maxLoadingDelay: 4,
+      });
+      hls.loadSource(url);
+      hls.attachMedia(player);
+      hls.currentLevel = -1;
+    } else if (player.canPlayType('application/vnd.apple.mpegurl')) {
+      player.src = url;
+      setLoading(false);
+      isSettingUpRef.current = false;
+      return;
+    } else {
+      setError('HLS not supported in this browser');
+      setLoading(false);
+      isSettingUpRef.current = false;
+      return;
+    }
+
+    hlsRef.current = hls;
+
+    const onManifestParsed = () => {
+      setLoading(false);
+      networkRetryCount.current = 0;
+
+      const levels = hls.levels.map((level, idx) => ({
+        index: idx,
+        label: level.height 
+          ? `${level.height}p (${Math.round((level.bitrate || 0)/1000)} kbps)` 
+          : `Level ${idx + 1}`,
+        bitrate: Math.round((level.bitrate || 0) / 1000),
+      }));
+      setQualities([{ index: -1, label: 'Auto' }, ...levels]);
+
+      if (userSelectedQualityRef.current === null) {
+        hls.currentLevel = -1;
+        setCurrentQuality(-1);
+      } else {
+        setCurrentQuality(hls.currentLevel);
+      }
+    };
+
+    const onLevelSwitched = (_, data) => {
+      if (userSelectedQualityRef.current === null) {
+        setCurrentQuality(data.level);
+      } else {
+        setCurrentQuality(hls.currentLevel);
+      }
+    };
+
+    const onError = (_, data) => {
+      console.error('HLS error', data);
+
+      if (!hlsRef.current) return;
+
+      if (data.fatal) {
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            if (networkRetryCount.current < MAX_NETWORK_RETRIES) {
+              networkRetryCount.current += 1;
+              console.log(`Retrying network... attempt ${networkRetryCount.current}`);
+              hlsRef.current.startLoad();
+            } else if (hlsRef.current.levels.length > 0) {
+              console.log('Switching to lowest quality due to network issues');
+              hlsRef.current.currentLevel = 0;
+              setCurrentQuality(0);
+              networkRetryCount.current = 0;
+            }
+            break;
+
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            console.log('Recovering media error...');
+            hlsRef.current.recoverMediaError();
+            break;
+
+          default:
+            setError('Video playback error');
+            break;
+        }
+      }
+    };
+
+    hls.on(Hls.Events.MANIFEST_PARSED, onManifestParsed);
+    hls.on(Hls.Events.LEVEL_SWITCHED, onLevelSwitched);
+    hls.on(Hls.Events.ERROR, onError);
+
+    if (hls.levels && hls.levels.length > 0) {
+      if (userSelectedQualityRef.current === null) hls.currentLevel = -1;
+      onManifestParsed();
+    }
+
+    isSettingUpRef.current = false;
+  }, [url]);
+
+  const handleReady = useCallback(() => {
+    let retries = 0;
+    const maxRetries = 10;
+
+    const trySetup = () => {
+      const player = playerRef.current?.getInternalPlayer();
+      if (!player) {
+        if (retries < maxRetries) {
+          retries++;
+          setTimeout(trySetup, 100);
+        }
+        return;
+      }
+
+      const hlsInstance = playerRef.current?.player?.hls || player.hls;
+      if (hlsInstance || Hls.isSupported()) {
+        setupHLS();
+      } else if (retries < maxRetries) {
+        retries++;
+        setTimeout(trySetup, 100);
+      }
+    };
+
+    setTimeout(trySetup, 100);
+  }, [setupHLS]);
+
+  useEffect(() => {
+    return () => {
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
       }
-      setIsLoading(false);
     };
+  }, []);
 
-    if (isHLS && Hls.isSupported()) {
-      const hls = new Hls({
-        enableWorker: true,
-        lowLatencyMode: false,
-        startLevel: -1, // Auto quality
-        capLevelToPlayerSize: true,
-      });
+  const handleQualitySelect = useCallback((index) => {
+    if (!hlsRef.current) return;
 
-      hlsRef.current = hls;
-      hls.loadSource(url);
-      hls.attachMedia(video);
-
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        setIsLoading(false);
-        setError(null);
-
-        const levels = hls.levels;
-        const qualityOptions = levels.map((level, index) => ({
-          index,
-          label: level.height ? `${level.height}p` : `Level ${index}`,
-          height: level.height,
-          bitrate: level.bitrate,
-        }));
-
-        qualityOptions.unshift({ index: -1, label: 'Auto', height: null, bitrate: null });
-        setQualities(qualityOptions);
-        setCurrentQuality(hls.currentLevel !== -1 ? hls.currentLevel : -1);
-
-        if (autoPlay) {
-          video.play().catch((err) => console.warn('Autoplay prevented:', err));
-        }
-      });
-
-      hls.on(Hls.Events.LEVEL_SWITCHED, () => {
-        setCurrentQuality(hls.currentLevel !== -1 ? hls.currentLevel : -1);
-      });
-
-      hls.on(Hls.Events.ERROR, (event, data) => {
-        if (data.fatal) {
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              hls.startLoad();
-              break;
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              hls.recoverMediaError();
-              break;
-            default:
-              setError('Failed to load video stream. Please check the URL.');
-              cleanup();
-              break;
-          }
-        }
-      });
-    } else if (isHLS && video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = url;
-      setIsLoading(false);
-      if (autoPlay) {
-        video.play().catch((err) => console.warn('Autoplay prevented:', err));
-      }
+    if (index === -1) {
+      hlsRef.current.currentLevel = -1;
+      setUserSelectedQuality(null);
+      userSelectedQualityRef.current = null;
+      setCurrentQuality(-1);
     } else {
-      video.src = url;
-      setIsLoading(false);
-      setQualities([]);
-      if (autoPlay) {
-        video.play().catch((err) => console.warn('Autoplay prevented:', err));
-      }
+      hlsRef.current.currentLevel = index;
+      setUserSelectedQuality(index);
+      userSelectedQualityRef.current = index;
+      setCurrentQuality(index);
     }
 
-    const handleLoadedMetadata = () => {
-      setDuration(video.duration);
-      setIsLoading(false);
-    };
+    setShowQualityMenu(false);
+  }, []);
 
-    const handleTimeUpdate = () => {
-      setCurrentTime(video.currentTime);
-    };
-
-    const handlePlay = () => setIsPlaying(true);
-    const handlePause = () => setIsPlaying(false);
-    const handleError = () => {
-      setError('Failed to load video. Please check the URL.');
-      setIsLoading(false);
-    };
-
-    video.addEventListener('loadedmetadata', handleLoadedMetadata);
-    video.addEventListener('timeupdate', handleTimeUpdate);
-    video.addEventListener('play', handlePlay);
-    video.addEventListener('pause', handlePause);
-    video.addEventListener('error', handleError);
-
-    return () => {
-      cleanup();
-      video.removeEventListener('loadedmetadata', handleLoadedMetadata);
-      video.removeEventListener('timeupdate', handleTimeUpdate);
-      video.removeEventListener('play', handlePlay);
-      video.removeEventListener('pause', handlePause);
-      video.removeEventListener('error', handleError);
-    };
-  }, [url, autoPlay]);
-
-  // Close settings menu when clicking outside
   useEffect(() => {
     const handleClickOutside = (event) => {
-      if (settingsMenuRef.current && !settingsMenuRef.current.contains(event.target)) {
-        const settingsButton = event.target.closest('.hls-settings-button');
-        if (!settingsButton) {
-          setShowSettings(false);
-        }
+      if (qualityMenuRef.current && !qualityMenuRef.current.contains(event.target)) {
+        setShowQualityMenu(false);
       }
     };
 
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, []);
-
-  const togglePlay = useCallback(() => {
-    const video = videoRef.current;
-    if (video) {
-      if (video.paused) {
-        video.play();
-      } else {
-        video.pause();
-      }
+    if (showQualityMenu) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => document.removeEventListener('mousedown', handleClickOutside);
     }
-  }, []);
+  }, [showQualityMenu]);
 
-  const handleProgressClick = useCallback((e) => {
-    const video = videoRef.current;
-    const progressBar = e.currentTarget;
-    const rect = progressBar.getBoundingClientRect();
-    const percent = (e.clientX - rect.left) / rect.width;
-    if (video && duration) {
-      video.currentTime = percent * duration;
-    }
-  }, [duration]);
-
-  const handleVolumeChange = useCallback((e) => {
-    const video = videoRef.current;
-    const newVolume = parseFloat(e.target.value);
-    if (video) {
-      video.volume = newVolume;
-      setVolume(newVolume);
-    }
-  }, []);
-
-  const handleQualitySelect = useCallback((qualityIndex) => {
-    setCurrentQuality(qualityIndex);
-    if (hlsRef.current) {
-      if (qualityIndex === -1) {
-        hlsRef.current.currentLevel = -1; // Auto
-      } else {
-        hlsRef.current.currentLevel = qualityIndex;
-      }
-    }
-    setShowSettings(false);
-  }, []);
-
-  const toggleFullscreen = useCallback(() => {
-    const container = containerRef.current;
-    if (container) {
-      if (!document.fullscreenElement) {
-        container.requestFullscreen().catch(err => console.log('Fullscreen error:', err));
-      } else {
-        document.exitFullscreen();
-      }
-    }
-  }, []);
-
-  const formatTime = (seconds) => {
-    if (!seconds || isNaN(seconds)) return '0:00';
-    const mins = Math.floor(seconds / 60);
-    const secs = Math.floor(seconds % 60);
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  const getCurrentQualityLabel = () => {
+    const current = qualities.find(q => q.index === currentQuality);
+    return current ? current.label : 'Auto';
   };
 
   if (error) {
@@ -218,99 +231,45 @@ const HLSPlayer = ({ url, autoPlay = false }) => {
     );
   }
 
-  const progressPercent = duration ? (currentTime / duration) * 100 : 0;
-
   return (
-    <div className="hls-player-container" ref={containerRef}>
-      <div className="hls-video-wrapper">
-        {isLoading && (
-          <div className="hls-loading">
-            <div className="hls-spinner"></div>
-            <p>Loading video...</p>
-          </div>
-        )}
-        <video
-          ref={videoRef}
-          className="hls-video"
-          playsInline
-          onClick={togglePlay}
-        />
-        
-        {/* Custom Controls */}
-        <div className="hls-controls">
-          {/* Progress Bar */}
-          <div className="hls-progress-bar" onClick={handleProgressClick}>
-            <div className="hls-progress-filled" style={{ width: `${progressPercent}%` }} />
-            <div className="hls-progress-handle" style={{ left: `${progressPercent}%` }} />
-          </div>
-
-          {/* Control Bar */}
-          <div className="hls-control-bar">
-            <div className="hls-control-left">
-              <button className="hls-play-button" onClick={togglePlay}>
-                {isPlaying ? '⏸' : '▶'}
-              </button>
-              
-              <div className="hls-volume-control">
-                <button 
-                  className="hls-volume-button"
-                  onClick={() => setShowVolumeControl(!showVolumeControl)}
+    <div className="hls-player-container">
+      {loading && <div className="hls-loading">Loading video...</div>}
+      <ReactPlayer
+        ref={playerRef}
+        url={url}
+        playing={autoPlay}
+        controls
+        width="100%"
+        height="100%"
+        onReady={handleReady}
+        config={{ file: { attributes: { playsInline: true } } }}
+      />
+      {qualities.length > 1 && (
+        <div className="hls-quality-selector" style={{ marginBottom: '60px' }} ref={qualityMenuRef}>
+          <button
+            className="hls-quality-button"
+            onClick={() => setShowQualityMenu(!showQualityMenu)}
+            title="Quality"
+          >
+            <span className="hls-quality-icon">⚙</span>
+            <span className="hls-quality-label">{getCurrentQualityLabel()}</span>
+          </button>
+          {showQualityMenu && (
+            <div className="hls-quality-menu">
+              {qualities.map((q) => (
+                <button
+                  key={q.index}
+                  onClick={() => handleQualitySelect(q.index)}
+                  className={`hls-quality-option ${currentQuality === q.index ? 'active' : ''}`}
                 >
-                  {volume === 0 ? '🔇' : volume < 0.5 ? '🔉' : '🔊'}
+                  <span>{q.label}</span>
+                  {currentQuality === q.index && <span className="hls-quality-check">✓</span>}
                 </button>
-                {showVolumeControl && (
-                  <input
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.01"
-                    value={volume}
-                    onChange={handleVolumeChange}
-                    className="hls-volume-slider"
-                  />
-                )}
-              </div>
-
-              <div className="hls-time-display">
-                {formatTime(currentTime)} / {formatTime(duration)}
-              </div>
+              ))}
             </div>
-
-            <div className="hls-control-right">
-              {qualities.length > 1 && (
-                <div className="hls-settings-container" ref={settingsMenuRef}>
-                  <button
-                    className="hls-settings-button"
-                    onClick={() => setShowSettings(!showSettings)}
-                    title="Settings"
-                  >
-                    ⚙
-                  </button>
-                  {showSettings && (
-                    <div className="hls-settings-menu">
-                      <div className="hls-settings-title">Quality</div>
-                      {qualities.map((quality) => (
-                        <button
-                          key={quality.index}
-                          className={`hls-quality-option ${currentQuality === quality.index ? 'active' : ''}`}
-                          onClick={() => handleQualitySelect(quality.index)}
-                        >
-                          {quality.label}
-                          {currentQuality === quality.index && ' ✓'}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-              
-              <button className="hls-fullscreen-button" onClick={toggleFullscreen} title="Fullscreen">
-                ⛶
-              </button>
-            </div>
-          </div>
+          )}
         </div>
-      </div>
+      )}
     </div>
   );
 };
